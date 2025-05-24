@@ -285,7 +285,7 @@ class BatchProcessDialog:
         # 创建批处理对话框
         batch_dialog = tk.Toplevel(self.parent)
         batch_dialog.title(_("batch_title"))
-        batch_dialog.geometry("700x500")
+        batch_dialog.geometry("700x550")  # 增加高度以容纳GPU并行度设置
         batch_dialog.resizable(True, True)
         batch_dialog.transient(self.parent)
         batch_dialog.grab_set()  # 模态对话框
@@ -416,6 +416,36 @@ class BatchProcessDialog:
                                      values=[25, 50, 75, 95])
         quality_combo.pack(side=tk.LEFT, padx=5)
         
+        # 添加GPU并行度选择（仅当GPU可用时）
+        if self.fixer.has_cuda:
+            # GPU并行度设置
+            parallel_frame = tk.LabelFrame(right_frame, text=_("gpu_parallel_settings") if _("gpu_parallel_settings") != "gpu_parallel_settings" else "GPU并行设置")
+            parallel_frame.pack(fill=tk.X, pady=5)
+            
+            # 并行级别控制
+            parallel_inner_frame = tk.Frame(parallel_frame)
+            parallel_inner_frame.pack(fill=tk.X, padx=10, pady=5)
+            
+            parallel_label = tk.Label(parallel_inner_frame, text=_("parallel_level") if _("parallel_level") != "parallel_level" else "并行级别")
+            parallel_label.pack(side=tk.LEFT)
+            
+            # 根据GPU内存估算最大并行数
+            max_parallel = 8  # 默认最大值
+            
+            # 创建并行级别下拉菜单
+            parallel_var = tk.IntVar(value=self.fixer.parallel_level)
+            parallel_values = list(range(1, max_parallel + 1))
+            parallel_combo = ttk.Combobox(parallel_inner_frame, textvariable=parallel_var, width=5,
+                                        values=parallel_values)
+            parallel_combo.pack(side=tk.LEFT, padx=5)
+            
+            # 并行度说明
+            parallel_info = tk.Label(parallel_frame, 
+                                    text=_("parallel_info") if _("parallel_info") != "parallel_info" else 
+                                    "并行级别表示同时处理的图像数量。更高的值可以提高处理速度，但会消耗更多GPU内存。",
+                                    wraplength=200, justify=tk.LEFT)
+            parallel_info.pack(fill=tk.X, padx=10, pady=5)
+            
         # 文件夹浏览按钮函数
         def select_input_folder():
             # 从当前图像目录或上次打开目录开始
@@ -514,6 +544,10 @@ class BatchProcessDialog:
             # 获取质量设置
             quality = quality_var.get()
             
+            # 获取并行级别设置（如果有）
+            if self.fixer.has_cuda and 'parallel_var' in locals():
+                self.fixer.parallel_level = parallel_var.get()
+            
             # 获取文件列表
             try:
                 files = [f for f in os.listdir(input_dir) if f.lower().endswith(ext.lower())]
@@ -527,8 +561,15 @@ class BatchProcessDialog:
                 skip_existing = skip_var.get()
                 
                 # 询问确认
-                if not messagebox.askyesno(_("confirm_title"), 
-                    _("batch_confirmation", count=files_count, ext=ext, input=input_dir, output=output_dir, quality=quality)):
+                parallel_info = ""
+                if self.fixer.has_cuda:
+                    parallel_info = _("parallel_confirm_info", level=self.fixer.parallel_level) if _("parallel_confirm_info") != "parallel_confirm_info" else f"并行级别: {self.fixer.parallel_level}"
+                
+                confirmation_message = _("batch_confirmation", count=files_count, ext=ext, input=input_dir, output=output_dir, quality=quality)
+                if parallel_info:
+                    confirmation_message += f"\n{parallel_info}"
+                
+                if not messagebox.askyesno(_("confirm_title"), confirmation_message):
                     return
                 
                 # 记住目录以便下次使用
@@ -590,11 +631,16 @@ class BatchProcessDialog:
         # 创建进度窗口
         progress_win = tk.Toplevel(self.parent)
         progress_win.title(_("batch_progress_title"))
-        progress_win.geometry("400x200")
+        progress_win.geometry("400x220")  # 稍微增加高度以容纳并行信息
         progress_win.resizable(False, False)
         progress_win.transient(self.parent)
         
-        tk.Label(progress_win, text=_("processing_with_quality", quality=quality)).pack(pady=10)
+        # 添加并行信息
+        if self.fixer.has_cuda and self.fixer.parallel_level > 1:
+            parallel_info = _("gpu_parallel_info", level=self.fixer.parallel_level) if _("gpu_parallel_info") != "gpu_parallel_info" else f"GPU并行级别: {self.fixer.parallel_level}"
+            tk.Label(progress_win, text=parallel_info).pack(pady=5)
+        
+        tk.Label(progress_win, text=_("processing_with_quality", quality=quality)).pack(pady=5)
         
         progress_var = tk.DoubleVar()
         progress_bar = ttk.Progressbar(progress_win, variable=progress_var, maximum=files_count, length=350)
@@ -625,47 +671,27 @@ class BatchProcessDialog:
         cancel_button.config(command=stop_processing, state=tk.NORMAL)
         
         def process_thread():
-            processed = 0
-            failed = 0
-            skipped = 0
-            
             try:
-                # 遍历文件夹中的文件
-                for i, filename in enumerate(files):
-                    # 检查取消标志
-                    if cancel_flag[0]:
-                        progress_win.after(0, lambda: status_label.config(text=_("batch_cancelled")))
-                        break
-                        
-                    input_path = os.path.join(input_dir, filename)
-                    output_path = os.path.join(output_dir, filename)
-                    
-                    # 检查是否跳过已存在文件
-                    if skip_existing and os.path.exists(output_path):
-                        skipped += 1
-                        progress_win.after(0, lambda i=i, f=filename, p=processed, s=skipped: 
-                                        update_progress(i+1, f, p, failed, s))
-                        continue
-                    
-                    # 更新状态
-                    progress_win.after(0, lambda f=filename: status_label.config(text=_("processing", filename=f)))
-                    
-                    # 修复图像
-                    try:
-                        if self.fixer.fix_image(input_path, output_path, quality):
-                            processed += 1
-                        else:
-                            failed += 1
-                    except Exception as e:
-                        print(_("process_error", filename=filename, error=str(e)))
-                        failed += 1
-                    
-                    # 更新进度条
-                    progress_win.after(0, lambda i=i, f=filename, p=processed, s=skipped: 
-                                    update_progress(i+1, f, p, failed, s))
+                # 准备要处理的文件路径列表
+                image_paths = [os.path.join(input_dir, filename) for filename in files]
+                
+                # 定义更新UI的回调函数
+                def update_callback(current, filename, processed, failed, skipped):
+                    progress_win.after(0, lambda: update_progress(current, filename, processed, failed, skipped))
+                
+                # 开始批处理
+                processed, failed, skipped = self.fixer.batch_process_images(
+                    image_paths, 
+                    output_dir, 
+                    quality, 
+                    skip_existing, 
+                    update_callback, 
+                    cancel_flag
+                )
                 
                 # 完成
                 progress_win.after(0, lambda: finish_batch(processed, failed, skipped, cancel_flag[0]))
+                
             except Exception as e:
                 progress_win.after(0, lambda e=e: handle_batch_error(str(e)))
         

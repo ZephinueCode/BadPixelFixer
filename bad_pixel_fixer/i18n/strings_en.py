@@ -118,4 +118,11 @@ STRINGS = {
     "lang_chinese": "中文",
     "lang_english": "English",
     "language_changed": "Language changed, restart the program to take effect",
+
+    # 示例：添加到中文字符串文件
+    "gpu_parallel_settings": "GPU parallel settings",
+    "parallel_level": "Parallel level",
+    "parallel_info": "Higher parallel level means more images processed at the same time. Higher values can speed up processing but consume more GPU memory.",
+    "parallel_confirm_info": "Parallel level: {level}",
+    "gpu_parallel_info": "GPU parallel level: {level}",
 }

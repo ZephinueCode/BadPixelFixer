@@ -6,16 +6,20 @@ import json
 import os
 import time
 from datetime import datetime
+import concurrent.futures
 
 class BadPixelFixerPyTorch:
     def __init__(self):
         self.bad_pixels = []  # 格式: [(x, y, radius), ...]
         self.image_size = None  # 记录配置文件对应的图像尺寸
-        self.current_radius = 1  # 默认半径
+        self.current_radius = 3  # 默认半径
         
         # 检查CUDA支持
         self.has_cuda = torch.cuda.is_available()
         self.device = torch.device("cuda" if self.has_cuda else "cpu")
+        
+        # 并行处理设置
+        self.parallel_level = 2  # 默认并行处理级别
         
         if self.has_cuda:
             cuda_device = torch.cuda.get_device_name(0)
@@ -103,7 +107,7 @@ class BadPixelFixerPyTorch:
                 for y, x in coords_np:
                     # 获取差异值，用于确定半径
                     diff_value = diff_tensor[0, 0, y, x].item()
-                    radius = max(1, min(3, int(diff_value / threshold)))
+                    radius = max(5, min(15, int(diff_value / threshold)))
                     bad_pixels.append((int(x), int(y), radius))
                 
                 print(f"使用PyTorch GPU检测到 {len(bad_pixels)} 个坏点，耗时: {time.time() - start_time:.2f} 秒")
@@ -140,7 +144,7 @@ class BadPixelFixerPyTorch:
                 # 只在平坦区域检测异常（低标准差），或极度异常的像素
                 if (diff > threshold and window_std < threshold*1.5) or diff > threshold*2:
                     # 智能设置半径：差异越大，半径越大
-                    radius = max(1, min(3, int(diff / threshold)))
+                    radius = max(5, min(15, int(diff / threshold)))
                     bad_pixels.append((x, y, radius))
         
         print(f"使用CPU检测到 {len(bad_pixels)} 个坏点，耗时: {time.time() - start_time:.2f} 秒")
@@ -182,7 +186,7 @@ class BadPixelFixerPyTorch:
         for x, y, radius in self.bad_pixels:
             if 0 <= y < mask.shape[0] and 0 <= x < mask.shape[1]:  # 边界检查
                 # 使用原始半径，避免过度扩展
-                cv2.circle(mask, (x, y), radius + 1, 255, -1)  # 只略微扩大1像素
+                cv2.circle(mask, (x, y), radius + 5, 255, -1)  # 只略微扩大5像素
         
         # 为过渡区域创建单独的掩码
         transition_mask = np.zeros_like(mask)
@@ -190,8 +194,12 @@ class BadPixelFixerPyTorch:
         dilated = cv2.dilate(mask, kernel, iterations=2)
         transition_mask = dilated - mask  # 只在边缘周围创建窄的过渡区
         
-        # 使用INPAINT_NS方法修复（保持边缘结构更好）
-        inpainted = cv2.inpaint(img, mask, 3, cv2.INPAINT_NS)
+        # 使用多种修复方法
+        inpainted_ns = cv2.inpaint(img, mask, 3, cv2.INPAINT_NS)  # 小窗口修复 - 保留更多细节
+        inpainted_telea = cv2.inpaint(img, mask, 7, cv2.INPAINT_TELEA)  # 大窗口 - 更平滑
+        
+        # 融合两种修复结果
+        inpainted = cv2.addWeighted(inpainted_ns, 0.7, inpainted_telea, 0.3, 0)
         
         # 使用PyTorch进行GPU加速的精细修复
         if self.has_cuda:
@@ -305,6 +313,107 @@ class BadPixelFixerPyTorch:
             cv2.imwrite(output_path, result)
         
         return True
+        
+    def batch_process_images(self, image_paths, output_dir, quality=95, skip_existing=True, callback=None, cancel_flag=None):
+        """批量处理图像，支持GPU并行"""
+        processed = 0
+        failed = 0
+        skipped = 0
+        
+        if not self.has_cuda or self.parallel_level <= 1:
+            # 单处理模式（CPU或GPU单任务）
+            for i, input_path in enumerate(image_paths):
+                if cancel_flag and cancel_flag[0]:
+                    break
+                    
+                file_name = os.path.basename(input_path)
+                output_path = os.path.join(output_dir, file_name)
+                
+                # 检查是否跳过已存在文件
+                if skip_existing and os.path.exists(output_path):
+                    skipped += 1
+                    if callback:
+                        callback(i+1, file_name, processed, failed, skipped)
+                    continue
+                
+                try:
+                    if self.fix_image(input_path, output_path, quality):
+                        processed += 1
+                    else:
+                        failed += 1
+                except Exception as e:
+                    print(f"处理图像出错 {file_name}: {str(e)}")
+                    failed += 1
+                
+                if callback:
+                    callback(i+1, file_name, processed, failed, skipped)
+        else:
+            # 并行处理模式（GPU多任务）
+            try:
+                # 根据并行度确定每批处理的数量
+                batch_size = self.parallel_level
+                results = []
+                
+                # 使用线程池进行并行处理
+                with concurrent.futures.ThreadPoolExecutor(max_workers=batch_size) as executor:
+                    # 提交所有任务
+                    future_to_file = {}
+                    for i, input_path in enumerate(image_paths):
+                        file_name = os.path.basename(input_path)
+                        output_path = os.path.join(output_dir, file_name)
+                        
+                        # 检查是否跳过已存在文件
+                        if skip_existing and os.path.exists(output_path):
+                            skipped += 1
+                            if callback:
+                                callback(i+1, file_name, processed, failed, skipped)
+                            continue
+                            
+                        # 提交任务
+                        future = executor.submit(
+                            self._process_single_image, 
+                            input_path, 
+                            output_path, 
+                            quality
+                        )
+                        future_to_file[future] = (i, file_name)
+                    
+                    # 处理完成的任务
+                    for future in concurrent.futures.as_completed(future_to_file):
+                        if cancel_flag and cancel_flag[0]:
+                            executor.shutdown(wait=False)
+                            break
+                            
+                        i, file_name = future_to_file[future]
+                        try:
+                            success = future.result()
+                            if success:
+                                processed += 1
+                            else:
+                                failed += 1
+                        except Exception as e:
+                            print(f"处理图像出错 {file_name}: {str(e)}")
+                            failed += 1
+                        
+                        if callback:
+                            callback(i+1, file_name, processed, failed, skipped)
+            
+            except Exception as e:
+                print(f"并行处理出错: {str(e)}")
+                # 回退到单任务处理
+                return self.batch_process_images(
+                    image_paths, output_dir, quality, skip_existing, callback, cancel_flag
+                )
+        
+        return processed, failed, skipped
+    
+    def _process_single_image(self, input_path, output_path, quality):
+        """处理单个图像的辅助函数，用于并行处理"""
+        try:
+            return self.fix_image(input_path, output_path, quality)
+        except Exception as e:
+            print(f"处理图像失败 {input_path}: {str(e)}")
+            return False
     
     def save_config(self, filename):
         """保存坏点配置"""
@@ -313,7 +422,8 @@ class BadPixelFixerPyTorch:
             "bad_pixels": self.bad_pixels,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "cuda_available": self.has_cuda,
-            "device": str(self.device)
+            "device": str(self.device),
+            "parallel_level": self.parallel_level
         }
         with open(filename, 'w') as f:
             json.dump(config, f)
@@ -325,5 +435,6 @@ class BadPixelFixerPyTorch:
         
         self.image_size = tuple(config.get("image_size")) if config.get("image_size") else None
         self.bad_pixels = config.get("bad_pixels", [])
+        self.parallel_level = config.get("parallel_level", 2)  # 加载并行度设置
         
         return config.get("timestamp", "未知")

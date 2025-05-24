@@ -118,4 +118,11 @@ STRINGS = {
     "lang_chinese": "中文",
     "lang_english": "English",
     "language_changed": "语言已更改，重启程序后生效",
+
+    # 示例：添加到中文字符串文件
+    "gpu_parallel_settings": "GPU并行设置",
+    "parallel_level": "并行级别",
+    "parallel_info": "并行级别表示同时处理的图像数量。更高的值可以提高处理速度，但会消耗更多GPU内存。",
+    "parallel_confirm_info": "并行级别: {level}",
+    "gpu_parallel_info": "GPU并行级别: {level}",
 }
