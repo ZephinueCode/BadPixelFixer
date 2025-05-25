@@ -454,7 +454,7 @@ class BatchProcessDialog:
             if folder:
                 input_path_var.set(folder)
                 # 尝试自动设置输出文件夹为"输入文件夹/fixed"
-                output_folder = os.path.join(folder, "fixed")
+                output_folder = os.path.join(folder, "fixed").replace("\\", "/")
                 output_path_var.set(output_folder)
                 refresh_file_list()
         
